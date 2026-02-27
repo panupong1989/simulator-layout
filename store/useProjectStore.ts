@@ -2,15 +2,7 @@ import { create } from "zustand"
 import { persist } from "zustand/middleware"
 import type { Area, Equipment, PlacedItem } from "@/lib/types"
 import { EQUIPMENTS } from "@/lib/equipmentCatalog"
-
-export type LayoutSnapshot = {
-    id: string
-    name: string
-    area: Area
-    walls: WallItem[]
-    placed: PlacedItem[]
-    savedAt: number
-}
+import { supabase } from "@/lib/supabaseClient"
 
 // ======================
 // WALL TYPES
@@ -26,12 +18,24 @@ export type WallItem = {
     thicknessCm: number
 }
 
+// ======================
+// DB ROW TYPE
+// ======================
+export type LayoutRow = {
+    id: string
+    name: string
+    area: Area
+    walls: WallItem[]
+    placed: PlacedItem[]
+    created_at: string
+    updated_at: string
+}
 
 // ======================
 // STATE
 // ======================
 type State = {
-    // --- 기존 ---
+    // core
     area: Area
     equipments: Equipment[]
     placed: PlacedItem[]
@@ -45,10 +49,9 @@ type State = {
     select: (id: string | null) => void
     toggleStack: (instanceId: string) => void
 
-    // --- WALL ---
+    // wall
     tool: ToolMode
     setTool: (t: ToolMode) => void
-
     walls: WallItem[]
     selectedWallId: string | null
     selectWall: (id: string | null) => void
@@ -56,17 +59,31 @@ type State = {
     updateWall: (id: string, patch: Partial<WallItem>) => void
     removeWall: (id: string) => void
 
-    // --- SAVED LAYOUTS ---
-    layouts: LayoutSnapshot[]
-    saveLayout: (name: string) => void
+    // layouts (จาก DB / local)
+    layouts: LayoutRow[]
+    isSyncingLayouts: boolean
+    lastSyncError: string | null
+
+    // Supabase CRUD
+    syncLayouts: () => Promise<void>
+    saveLayout: (name: string) => Promise<void>
     loadLayout: (id: string) => void
-    deleteLayout: (id: string) => void
-    renameLayout: (id: string, name: string) => void
+    deleteLayout: (id: string) => Promise<void>
+    renameLayout: (id: string, name: string) => Promise<void>
+
+    // optional: local-only utils
+    upsertLayoutLocal: (row: LayoutRow) => void
+    removeLayoutLocal: (id: string) => void
 }
 
 // ======================
-// HELPERS (ของเดิม)
+// helpers
 // ======================
+function normRot(rotDeg?: number) {
+    return (((rotDeg ?? 0) % 360) + 360) % 360
+}
+
+// ✅ base = L1 ที่ overlap กับ “ตำแหน่งปัจจุบันของตัวที่จะเป็น L2” มากสุด (ของคุณเดิม)
 function rectOverlapArea(
     a: { x: number; y: number; w: number; h: number },
     b: { x: number; y: number; w: number; h: number }
@@ -80,17 +97,12 @@ function rectOverlapArea(
     return w > 0 && h > 0 ? w * h : 0
 }
 
-function normRot(rotDeg?: number) {
-    return (((rotDeg ?? 0) % 360) + 360) % 360
-}
-
 function footprintCm(def: Equipment, rotDeg?: number) {
     const r = normRot(rotDeg)
     const swap = r === 90 || r === 270
     return { wCm: swap ? def.dCm : def.wCm, dCm: swap ? def.wCm : def.dCm }
 }
 
-// ✅ base = L1 ที่ overlap กับ “ตำแหน่งปัจจุบันของตัวที่จะเป็น L2” มากสุด
 function findBestBaseFor(me: PlacedItem, placed: PlacedItem[], equipments: Equipment[]) {
     const meDef = equipments.find((e) => e.id === me.equipmentId)
     if (!meDef) return null
@@ -102,7 +114,7 @@ function findBestBaseFor(me: PlacedItem, placed: PlacedItem[], equipments: Equip
 
     for (const q of placed) {
         if (q.instanceId === me.instanceId) continue
-        if ((q.stackLevel ?? 0) !== 0) continue // base ต้องเป็น L1
+        if ((q.stackLevel ?? 0) !== 0) continue
 
         const qDef = equipments.find((e) => e.id === q.equipmentId)
         if (!qDef) continue
@@ -115,12 +127,15 @@ function findBestBaseFor(me: PlacedItem, placed: PlacedItem[], equipments: Equip
     }
 
     if (!best) return null
-
-    // ✅ threshold แนะนำ: อย่างน้อย 20% ของพื้นที่ตัวที่จะซ้อน
     const movingArea = a.w * a.h
     if (best.area < movingArea * 0.2) return null
-
     return best.id
+}
+
+// สร้าง row แบบ client-side ก่อน (created_at/updated_at จะได้ค่าจาก DB ตอน insert แต่เราทำไว้ให้ UI ลื่น)
+function makeLocalRow(args: { id: string; name: string; area: Area; walls: WallItem[]; placed: PlacedItem[] }): LayoutRow {
+    const nowIso = new Date().toISOString()
+    return { ...args, created_at: nowIso, updated_at: nowIso }
 }
 
 // ======================
@@ -129,7 +144,7 @@ function findBestBaseFor(me: PlacedItem, placed: PlacedItem[], equipments: Equip
 export const useProjectStore = create<State>()(
     persist(
         (set, get) => ({
-            // ---- existing ----
+            // core
             area: { wCm: 500, dCm: 300, gridCm: 10 },
             equipments: EQUIPMENTS as unknown as Equipment[],
             placed: [],
@@ -146,7 +161,7 @@ export const useProjectStore = create<State>()(
                         yCm,
                         rotationDeg: 0,
                         stackLevel: 0,
-                        // stackBaseId: null, // ถ้า type PlacedItem มี field นี้อยู่แล้ว ปลดคอมเมนต์ได้
+                        stackBaseId: null,
                     }),
                 })),
 
@@ -169,7 +184,6 @@ export const useProjectStore = create<State>()(
                     const me = s.placed.find((p) => p.instanceId === instanceId)
                     if (!me) return s
 
-                    // L1 -> L2
                     if ((me.stackLevel ?? 0) === 0) {
                         const baseId = findBestBaseFor(me, s.placed, s.equipments)
                         const base = baseId ? s.placed.find((p) => p.instanceId === baseId) : null
@@ -178,108 +192,190 @@ export const useProjectStore = create<State>()(
                             ...s,
                             placed: s.placed.map((p) =>
                                 p.instanceId === instanceId
-                                    ? {
+                                    ? ({
                                         ...p,
                                         stackLevel: 1,
                                         stackBaseId: baseId ?? null,
                                         xCm: base ? base.xCm : p.xCm,
                                         yCm: base ? base.yCm : p.yCm,
-                                    }
+                                    } as any)
                                     : p
                             ),
                         }
                     }
 
-                    // L2 -> L1
                     return {
                         ...s,
-                        placed: s.placed.map((p) => (p.instanceId === instanceId ? { ...p, stackLevel: 0, stackBaseId: null } : p)),
+                        placed: s.placed.map((p) =>
+                            p.instanceId === instanceId
+                                ? ({
+                                    ...p,
+                                    stackLevel: 0,
+                                    stackBaseId: null,
+                                } as any)
+                                : p
+                        ),
                     }
                 }),
 
             removePlaced: (instanceId) => set((s) => ({ placed: s.placed.filter((p) => p.instanceId !== instanceId) })),
-
             select: (id) => set({ selectedId: id }),
 
-            // ---- WALL ----
+            // wall
             tool: "select",
             setTool: (t) => set({ tool: t }),
 
             walls: [],
             selectedWallId: null,
-
             selectWall: (id) => set({ selectedWallId: id }),
 
-            addWall: (w) =>
-                set((s) => ({
-                    walls: [...s.walls, w],
-                })),
-
-            updateWall: (id, patch) =>
-                set((s) => ({
-                    walls: s.walls.map((x) => (x.id === id ? { ...x, ...patch } : x)),
-                })),
-
+            addWall: (w) => set((s) => ({ walls: [...s.walls, w] })),
+            updateWall: (id, patch) => set((s) => ({ walls: s.walls.map((x) => (x.id === id ? { ...x, ...patch } : x)) })),
             removeWall: (id) =>
                 set((s) => ({
                     walls: s.walls.filter((x) => x.id !== id),
                     selectedWallId: s.selectedWallId === id ? null : s.selectedWallId,
                 })),
 
-            // ---- SAVED LAYOUTS ----
+            // layouts
             layouts: [],
+            isSyncingLayouts: false,
+            lastSyncError: null,
 
-            saveLayout: (name) =>
+            upsertLayoutLocal: (row) =>
                 set((s) => {
-                    const n = (name ?? "").trim()
-                    if (!n) return s
-
-                    const snap: LayoutSnapshot = {
-                        id: crypto.randomUUID(),
-                        name: n,
-                        savedAt: Date.now(),   // ✅ ใช้ชื่อ field ให้ตรง type
-                        area: { ...s.area },
-                        walls: s.walls.map(w => ({ ...w })),
-                        placed: s.placed.map(p => ({ ...p })),
+                    const idx = s.layouts.findIndex((x) => x.id === row.id)
+                    if (idx >= 0) {
+                        const copy = s.layouts.slice()
+                        copy[idx] = row
+                        // sort ล่าสุดก่อน
+                        copy.sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1))
+                        return { layouts: copy }
                     }
-
-                    return { ...s, layouts: [snap, ...s.layouts] }
+                    const next = [row, ...s.layouts]
+                    next.sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1))
+                    return { layouts: next }
                 }),
 
+            removeLayoutLocal: (id) => set((s) => ({ layouts: s.layouts.filter((x) => x.id !== id) })),
+
+            // ---------- Supabase: list ----------
+            syncLayouts: async () => {
+                set({ isSyncingLayouts: true, lastSyncError: null })
+                try {
+                    const { data, error } = await supabase
+                        .from("layouts")
+                        .select("id,name,area,walls,placed,created_at,updated_at")
+                        .order("updated_at", { ascending: false })
+
+                    if (error) throw error
+                    set({ layouts: (data ?? []) as LayoutRow[] })
+                } catch (e: any) {
+                    set({ lastSyncError: e?.message ?? String(e) })
+                } finally {
+                    set({ isSyncingLayouts: false })
+                }
+            },
+
+            // ---------- Supabase: save ----------
+            saveLayout: async (name) => {
+                const n = (name ?? "").trim()
+                if (!n) return
+
+                const s = get()
+                // ทำ row local ก่อน เพื่อให้ UI มีทันที
+                const localId = crypto.randomUUID()
+                const localRow = makeLocalRow({ id: localId, name: n, area: s.area, walls: s.walls, placed: s.placed })
+                get().upsertLayoutLocal(localRow)
+
+                try {
+                    // insert จริงไป DB
+                    const { data, error } = await supabase
+                        .from("layouts")
+                        .insert([
+                            {
+                                id: localId, // ใช้ id เดียวกัน (ง่ายสุด)
+                                name: n,
+                                area: s.area,
+                                walls: s.walls,
+                                placed: s.placed,
+                            },
+                        ])
+                        .select("id,name,area,walls,placed,created_at,updated_at")
+                        .single()
+
+                    if (error) throw error
+                    // replace ด้วยค่าจาก DB (created_at/updated_at จริง)
+                    if (data) get().upsertLayoutLocal(data as LayoutRow)
+                } catch (e: any) {
+                    // ถ้า DB ไม่ได้ ให้แจ้งไว้ แต่ local ยังอยู่
+                    set({ lastSyncError: e?.message ?? String(e) })
+                }
+            },
+
+            // ---------- load ----------
             loadLayout: (id) =>
                 set((s) => {
                     const x = s.layouts.find((k) => k.id === id)
                     if (!x) return s
                     return {
                         ...s,
-                        area: { ...x.area },
-                        walls: x.walls.map(w => ({ ...w })),
-                        placed: x.placed.map(p => ({ ...p })),
+                        area: x.area,
+                        walls: x.walls,
+                        placed: x.placed,
                         selectedId: null,
                         selectedWallId: null,
                         tool: "select",
                     }
                 }),
 
-            deleteLayout: (id) =>
-                set((s) => ({ ...s, layouts: s.layouts.filter((k) => k.id !== id) })),
+            // ---------- delete ----------
+            deleteLayout: async (id) => {
+                // optimistic
+                get().removeLayoutLocal(id)
 
-            renameLayout: (id, name) =>
-                set((s) => ({
-                    ...s,
-                    layouts: s.layouts.map((k) => (k.id === id ? { ...k, name: name.trim() } : k)),
-                })),
+                try {
+                    const { error } = await supabase.from("layouts").delete().eq("id", id)
+                    if (error) throw error
+                } catch (e: any) {
+                    set({ lastSyncError: e?.message ?? String(e) })
+                    // ถ้าจะ “undo” ก็ทำได้ แต่ต้องมี snapshot เดิมไว้ (เวอร์ชันนี้ไม่ทำ undo)
+                }
+            },
 
+            // ---------- rename ----------
+            renameLayout: async (id, name) => {
+                const n = (name ?? "").trim()
+                if (!n) return
+
+                // optimistic local
+                const prev = get().layouts.find((x) => x.id === id)
+                if (prev) get().upsertLayoutLocal({ ...prev, name: n, updated_at: new Date().toISOString() })
+
+                try {
+                    const { data, error } = await supabase
+                        .from("layouts")
+                        .update({ name: n })
+                        .eq("id", id)
+                        .select("id,name,area,walls,placed,created_at,updated_at")
+                        .single()
+
+                    if (error) throw error
+                    if (data) get().upsertLayoutLocal(data as LayoutRow)
+                } catch (e: any) {
+                    set({ lastSyncError: e?.message ?? String(e) })
+                }
+            },
         }),
         {
-            name: "simulator-layout-v2",
+            name: "simulator-layout-v3",
+            // เก็บ local state ไว้ด้วย เผื่อ offline
             partialize: (s) => ({
                 area: s.area,
                 placed: s.placed,
                 walls: s.walls,
-                layouts: s.layouts, // ✅ เพิ่ม
+                layouts: s.layouts,
             }),
         }
-
     )
 )
