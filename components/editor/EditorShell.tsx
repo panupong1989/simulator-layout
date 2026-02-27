@@ -1,13 +1,21 @@
 "use client"
 
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import Plan2DStage from "@/components/plan2d/Plan2DStage"
 import View3DCanvas from "@/components/view3d/View3DCanvas"
+import { useProjectStore } from "@/store/useProjectStore"
 
 type TabKey = "2d" | "3d"
 
 export default function EditorShell() {
     const [tab, setTab] = useState<TabKey>("2d")
+
+    const syncLayouts = useProjectStore((s) => s.syncLayouts)
+    const err = useProjectStore((s) => s.lastSyncError)
+
+    useEffect(() => {
+        syncLayouts()
+    }, [syncLayouts])
 
     return (
         <div className="h-screen flex flex-col">
@@ -36,6 +44,9 @@ export default function EditorShell() {
                 >
                     3D
                 </button>
+
+                {/* debug error (ถ้ามี) */}
+                {err ? <div className="ml-3 text-xs text-red-400">{err}</div> : null}
             </div>
 
             {/* Content */}
