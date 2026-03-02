@@ -10,13 +10,14 @@ import { useEffect, useRef } from "react"
 import type { OrbitControls as OrbitControlsImpl } from "three-stdlib"
 import Walls3D_NotchPro from "@/components/view3d/Walls3D_NotchPro"
 import Walls3D_Cut from "@/components/view3d/Walls3D_Cut"
+import Posters3D from "@/components/view3d/Posters3D"
 
 const CM_TO_M = 0.01
 
 export default function View3DCanvas() {
     const controlsRef = useRef<OrbitControlsImpl | null>(null)
 
-    const { area, equipments, placed, walls } = useProjectStore() as any
+    const { area, equipments, placed, walls, posters } = useProjectStore() as any
     const W = ((area?.wCm ?? 500) * CM_TO_M)
     const D = ((area?.dCm ?? 300) * CM_TO_M)
 
@@ -72,6 +73,16 @@ export default function View3DCanvas() {
                     notchSingleHeightCm={100}
                     notchStackHeightCm={190}
                     endPadCm={5}
+                />
+
+                <Posters3D
+                    posters={posters ?? []}
+                    walls={walls ?? []}
+                    areaWm={W}
+                    areaDm={D}
+                    floorIsCentered
+                    wallOutOffsetM={0.02}   // ดันออกจากผนังเพิ่มนิด กันจม
+                    centerHeightM={1.45}
                 />
 
                 {ps.map((p: PlacedItem) => {

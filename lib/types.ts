@@ -35,3 +35,15 @@ export type WallItem = {
     y2Cm: number
     thicknessCm: number
 }
+
+export type PosterKey = "rule" | "price" | "howto"
+
+export type PosterItem = {
+    id: string
+    wallId: string
+    t: number          // 0..1 ตำแหน่งตามแนวผนัง
+    wCm: number
+    hCm: number
+    offsetCm: number   // ระยะห่างจากผนัง (เริ่ม 0)
+    imageKey: PosterKey
+}

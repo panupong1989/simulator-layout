@@ -8,6 +8,9 @@ import { useProjectStore } from "@/store/useProjectStore"
 import type { Equipment, PlacedItem } from "@/lib/types"
 import { edgeSnapNearCm } from "@/lib/edgeSnapNear"
 import { useCallback } from "react"
+import { Poster2D } from "@/components/plan2d/Poster2D"
+import type { PosterItem } from "@/lib/posters"
+import { POSTER_SPECS } from "@/lib/posters"
 
 // ============================
 // TUNING
@@ -246,8 +249,48 @@ function buildArrowBelowLabel(args: {
     }
 }
 
-function isNearPointPx(px: { x: number; y: number }, p: { x: number; y: number }, r: number) {
-    return Math.hypot(px.x - p.x, px.y - p.y) <= r
+function projectTOnWall(xCm: number, yCm: number, w: WallItem) {
+    const vx = w.x2Cm - w.x1Cm
+    const vy = w.y2Cm - w.y1Cm
+    const wx = xCm - w.x1Cm
+    const wy = yCm - w.y1Cm
+    const vv = vx * vx + vy * vy
+    const t = vv <= 1e-9 ? 0 : (wx * vx + wy * vy) / vv
+    return Math.max(0, Math.min(1, t))
+}
+
+function nearestWallForPoint(xCm: number, yCm: number, walls: WallItem[]) {
+    let best: { wallId: string; t: number; dist2: number } | null = null
+    for (const w of walls) {
+        const vx = w.x2Cm - w.x1Cm
+        const vy = w.y2Cm - w.y1Cm
+        const wx = xCm - w.x1Cm
+        const wy = yCm - w.y1Cm
+        const vv = vx * vx + vy * vy
+        const tRaw = vv <= 1e-9 ? 0 : (wx * vx + wy * vy) / vv
+        const t = Math.max(0, Math.min(1, tRaw))
+        const px = w.x1Cm + vx * t
+        const py = w.y1Cm + vy * t
+        const dx = xCm - px
+        const dy = yCm - py
+        const dist2 = dx * dx + dy * dy
+        if (!best || dist2 < best.dist2) best = { wallId: w.id, t, dist2 }
+    }
+    return best
+}
+
+function clamp01(x: number) {
+    return Math.max(0, Math.min(1, x))
+}
+
+function tOnWallFromPointCm(w: { x1Cm: number; y1Cm: number; x2Cm: number; y2Cm: number }, xCm: number, yCm: number) {
+    const vx = w.x2Cm - w.x1Cm
+    const vy = w.y2Cm - w.y1Cm
+    const wx = xCm - w.x1Cm
+    const wy = yCm - w.y1Cm
+    const vv = vx * vx + vy * vy
+    const t = vv <= 1e-9 ? 0 : (wx * vx + wy * vy) / vv
+    return clamp01(t)
 }
 
 export default function Plan2DStage() {
@@ -256,6 +299,16 @@ export default function Plan2DStage() {
     const wrapRef = useRef<HTMLDivElement | null>(null)
 
     const s = useProjectStore() as any
+
+    const posters = useProjectStore((s) => s.posters) as PosterItem[]
+    const posterTool = s.posterTool ?? null
+    const setPosterTool = s.setPosterTool ?? (() => { })
+    const addPosterOnWall = s.addPosterOnWall ?? (() => { })
+    const updatePosterT = s.updatePosterT ?? (() => { })
+    const removePoster = s.removePoster ?? (() => { })
+    const selectedPosterId = s.selectedPosterId ?? null
+    const selectPoster = s.selectPoster ?? (() => { })
+    const flipPoster = s.flipPoster ?? (() => { })
 
     const walls: WallItem[] = s.walls ?? []
     const selectedWallId: string | null = s.selectedWallId ?? null
@@ -308,6 +361,7 @@ export default function Plan2DStage() {
         updateWall: (id: string, patch: Partial<WallItem>) => void
         removeWall: (id: string) => void
         selectWall: (id: string | null) => void
+        flipPoster: (id: string) => void
     }
 
     const [zoomPct, setZoomPct] = useState<(typeof ZOOMS)[number]>(100)
@@ -326,6 +380,7 @@ export default function Plan2DStage() {
 
     const canActEquip = !!selectedId
     const canActWall = !!selectedWallId
+    const canActPoster = !!selectedPosterId
 
     // ----------------------------
     // Area input
@@ -340,15 +395,18 @@ export default function Plan2DStage() {
 
 
     const deleteSelected = useCallback(() => {
+        if (selectedPosterId) {
+            removePoster(selectedPosterId)
+            selectPoster(null)
+            return
+        }
         if (selectedWallId) {
             removeWall(selectedWallId)
             selectWall(null)
             return
         }
-        if (selectedId) {
-            removePlaced(selectedId)
-        }
-    }, [selectedWallId, selectedId, removeWall, selectWall, removePlaced])
+        if (selectedId) removePlaced(selectedId)
+    }, [selectedPosterId, removePoster, selectPoster, selectedWallId, selectedId, removeWall, selectWall, removePlaced])
 
     useEffect(() => {
         const onKeyDown = (ev: KeyboardEvent) => {
@@ -387,24 +445,32 @@ export default function Plan2DStage() {
     // ----------------------------
     const handleDrop: React.DragEventHandler<HTMLDivElement> = (e) => {
         e.preventDefault()
-        const equipmentId = e.dataTransfer.getData("equipmentId")
-        if (!equipmentId) return
 
         const stage = stageRef.current
         const wrap = wrapRef.current
         if (!stage || !wrap) return
 
         const rect = wrap.getBoundingClientRect()
-
-        // mouse in wrapper viewport
         const localX = e.clientX - rect.left + wrap.scrollLeft
         const localY = e.clientY - rect.top + wrap.scrollTop
+        const xCm = pxToCm(localX)
+        const yCm = pxToCm(localY)
 
-        // ✅ แปลง px -> cm ด้วย zoom (pxToCm มี zoom รวมอยู่แล้ว)
-        const xCm = snapStep(pxToCm(localX), SNAP_STEP_CM)
-        const yCm = snapStep(pxToCm(localY), SNAP_STEP_CM)
+        // ✅ 1) Poster drop
+        const posterKey = e.dataTransfer.getData("posterKey") as any
+        if (posterKey) {
+            const hit = nearestWallForPoint(xCm, yCm, walls)
+            if (hit) {
+                // กันหลุด wall มากไป: ระยะห่าง <= 20cm ค่อยให้วาง (ปรับได้)
+                if (hit.dist2 <= 20 * 20) addPosterOnWall(hit.wallId, hit.t, posterKey)
+            }
+            return
+        }
 
-        addPlaced(equipmentId, xCm, yCm)
+        // ✅ 2) Equipment drop (เดิม)
+        const equipmentId = e.dataTransfer.getData("equipmentId")
+        if (!equipmentId) return
+        addPlaced(equipmentId, snapStep(xCm, SNAP_STEP_CM), snapStep(yCm, SNAP_STEP_CM))
     }
 
     // ----------------------------
@@ -678,11 +744,16 @@ export default function Plan2DStage() {
                         <button
                             className={[
                                 "px-3 py-1 rounded-md text-xs font-semibold transition",
-                                canActEquip ? "bg-white text-[#0b3a64] hover:bg-white/90" : "bg-white/20 text-white/50 cursor-not-allowed",
+                                (canActEquip || canActPoster)
+                                    ? "bg-white text-[#0b3a64] hover:bg-white/90"
+                                    : "bg-white/20 text-white/50 cursor-not-allowed",
                             ].join(" ")}
-                            disabled={!canActEquip}
+                            disabled={!(canActEquip || canActPoster)}
                             onMouseDown={(e) => e.stopPropagation()}
-                            onClick={() => selectedId && rotatePlaced(selectedId)}
+                            onClick={() => {
+                                if (selectedPosterId) flipPoster(selectedPosterId)     // ✅ poster rotate/flip
+                                else if (selectedId) rotatePlaced(selectedId)          // ✅ equipment rotate
+                            }}
                         >
                             Rotate
                         </button>
@@ -762,6 +833,31 @@ export default function Plan2DStage() {
                                 + {e.name}
                             </div>
                         ))}
+
+                        {/* Poster palette group */}
+                        <div className="flex items-center gap-2 shrink-0">
+                            <div className="text-xs text-white/70 px-2">POSTERS</div>
+
+                            {(["rule", "price", "howto"] as const).map((k) => (
+                                <div
+                                    key={k}
+                                    draggable
+                                    onDragStart={(ev) => {
+                                        ev.dataTransfer.setData("posterKey", k)
+                                        ev.dataTransfer.effectAllowed = "copy"
+                                    }}
+                                    onClick={() => setPosterTool(k)}
+                                    className={[
+                                        "shrink-0 px-3 py-1 rounded-lg border border-white/30 cursor-grab active:cursor-grabbing select-none text-xs font-semibold",
+                                        posterTool === k ? "bg-amber-300 text-black" : "bg-white text-[#0b3a64] hover:bg-white/90",
+                                    ].join(" ")}
+                                    title="Drag onto wall (or click then click wall)"
+                                    onMouseDown={(e) => e.stopPropagation()}
+                                >
+                                    + {k.toUpperCase()}
+                                </div>
+                            ))}
+                        </div>
                     </div>
                 </div>
 
@@ -1152,6 +1248,41 @@ export default function Plan2DStage() {
                                     }}
                                     onMouseDown={(ev) => {
                                         ev.cancelBubble = true
+
+                                        // ✅ ถ้าอยู่ในโหมดวางโปสเตอร์ -> วางเลย ไม่ต้อง select wall
+                                        if (posterTool) {
+                                            const stage = ev.target.getStage?.()
+                                            const p = stage?.getPointerPosition?.()
+                                            if (!p) return
+
+                                            // ✅ เอา pointer เป็น local ของ wall-group (px)
+                                            const localPx = {
+                                                x: p.x - x1,
+                                                y: p.y - y1,
+                                            }
+
+                                            // ✅ local px -> local cm
+                                            const localCm = {
+                                                x: pxToCm(localPx.x),
+                                                y: pxToCm(localPx.y),
+                                            }
+
+                                            // wall vector ใน "cm local" = (dxCm, dyCm)
+                                            const dxCm = w.x2Cm - w.x1Cm
+                                            const dyCm = w.y2Cm - w.y1Cm
+
+                                            // จุดคลิก local เทียบกับจุดเริ่ม wall (local start = 0,0)
+                                            const wx = localCm.x
+                                            const wy = localCm.y
+
+                                            const vv = dxCm * dxCm + dyCm * dyCm
+                                            const t = vv <= 1e-9 ? 0 : Math.max(0, Math.min(1, (wx * dxCm + wy * dyCm) / vv))
+
+                                            addPosterOnWall(w.id, t, posterTool)
+                                            return
+                                        }
+
+                                        // ✅ โหมดปกติ: select wall
                                         select(null)
                                         selectWall(w.id)
                                         setTool("select")
@@ -1258,6 +1389,116 @@ export default function Plan2DStage() {
                                             />
                                         </>
                                     )}
+                                </Group>
+                            )
+                        })}
+
+                        {/* POSTERS (2D = flat rect + label) */}
+                        {/* หลังจาก render walls เสร็จ */}
+                        {posters.map((p: PosterItem) => {
+                            const w = walls.find((x) => x.id === p.wallId)
+                            if (!w) return null
+
+                            // point on wall (cm)
+                            const xCm = w.x1Cm + (w.x2Cm - w.x1Cm) * p.t
+                            const yCm = w.y1Cm + (w.y2Cm - w.y1Cm) * p.t
+
+                            // wall direction + angle
+                            const vx = w.x2Cm - w.x1Cm
+                            const vy = w.y2Cm - w.y1Cm
+                            const len = Math.hypot(vx, vy) || 1
+                            const angRad = Math.atan2(vy, vx)
+                            const angDeg = (angRad * 180) / Math.PI
+
+                            // normal (ดันเข้า/ออกจากเส้นกำแพงนิดหน่อย)
+                            const nx = -vy / len
+                            const ny = vx / len
+
+                            // ✅ ให้โปสเตอร์ “ไม่หลุดออกจากเส้นกำแพง”:
+                            const side = p.flip ? 1 : -1
+                            const stickCm = 0.5 // ✅ ชิดผิวกำแพง (ปรับ 0..1)
+                            const extra = p.offsetCm ?? 0
+                            const offsetCm = side * (stickCm + extra)
+
+                            const px = cmToPx(xCm + nx * offsetCm)
+                            const py = cmToPx(yCm + ny * offsetCm)
+
+                            // ✅ ใช้ขนาดจริงจาก POSTER_SPECS (cm -> px)
+                            const spec = POSTER_SPECS[p.imageKey]
+                            const wPx = cmToPx(spec.wCm)
+                            const hPx = cmToPx(spec.hCm)
+
+                            // ความหนาแถบใน top-view (ไม่ต้องเท่าความสูงจริง)
+                            const bandPx = Math.max(14, u(16))  // ✅ หนาอ่านง่าย (ปรับได้)
+
+                            // ✅ ให้แถบหนาใน top-view = ความหนาผนัง หรือกำหนดเอง
+                            const thickPx = Math.max(8, cmToPx(2)) // 2cm เป็นความหนาให้เห็นชัด (ปรับได้)
+
+                            const selected = selectedPosterId === p.id
+
+                            return (
+                                <Group
+                                    key={p.id}
+                                    x={px}
+                                    y={py}
+                                    rotation={angDeg}
+                                    onMouseDown={(ev) => {
+                                        ev.cancelBubble = true
+                                        select(null)
+                                        selectWall(null)
+                                        selectPoster(p.id)
+                                        setTool("select")
+                                    }}
+
+                                    onDblClick={(ev) => {
+                                        ev.cancelBubble = true
+                                        flipPoster(p.id)
+                                    }}
+
+                                    draggable={selected} // ✅ เลือกแล้วลากได้
+                                    onDragMove={(ev) => {
+                                        ev.cancelBubble = true
+
+                                        // ตอนลาก: เอา position world->cm แล้ว "ฉายกลับลงบนเส้นกำแพง" เพื่ออัปเดต t
+                                        const stage = ev.target.getStage()
+                                        const pos = ev.target.absolutePosition()
+                                        const xCm2 = pxToCm(pos.x)
+                                        const yCm2 = pxToCm(pos.y)
+
+                                        const wx = xCm2 - w.x1Cm
+                                        const wy = yCm2 - w.y1Cm
+                                        const vv = vx * vx + vy * vy
+                                        const t = vv <= 1e-9 ? 0 : Math.max(0, Math.min(1, (wx * vx + wy * vy) / vv))
+                                        updatePosterT(p.id, t)
+
+                                        // ✅ บังคับให้เกาะผิวกำแพงทันที
+                                        const xCm3 = w.x1Cm + (w.x2Cm - w.x1Cm) * t
+                                        const yCm3 = w.y1Cm + (w.y2Cm - w.y1Cm) * t
+                                        const px3 = cmToPx(xCm3 + nx * offsetCm)
+                                        const py3 = cmToPx(yCm3 + ny * offsetCm)
+                                        ev.target.absolutePosition({ x: px3, y: py3 })
+                                    }}
+                                >
+                                    {/* สี่เหลี่ยมเล็ก */}
+                                    <Rect
+                                        x={-wPx / 2}
+                                        y={-bandPx / 2}
+                                        width={wPx}
+                                        height={bandPx}
+                                        fill={selected ? "rgba(59,130,246,0.28)" : "rgba(255,255,255,0.75)"} // ✅ พื้นหลังสว่าง
+                                        stroke="#111827"
+                                        strokeWidth={1}
+                                        cornerRadius={u(3)}
+                                    />
+
+                                    <Text
+                                        text={p.imageKey.toUpperCase()}
+                                        fontSize={10}
+                                        fill="#111827"
+                                        x={-wPx / 2 + 2}
+                                        y={-thickPx / 2 + 2}
+                                        listening={false}
+                                    />
                                 </Group>
                             )
                         })}

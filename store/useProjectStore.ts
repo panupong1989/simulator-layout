@@ -3,6 +3,8 @@ import { persist } from "zustand/middleware"
 import type { Area, Equipment, PlacedItem } from "@/lib/types"
 import { EQUIPMENTS } from "@/lib/equipmentCatalog"
 import { supabase } from "@/lib/supabaseClient"
+import type { PosterItem, PosterKey } from "@/lib/posters"
+import { POSTER_SPECS } from "@/lib/posters"
 
 // ======================
 // WALL TYPES
@@ -27,6 +29,7 @@ export type LayoutRow = {
     area: Area
     walls: WallItem[]
     placed: PlacedItem[]
+    posters: PosterItem[]
     created_at: string
     updated_at: string
 }
@@ -74,6 +77,18 @@ type State = {
     // optional: local-only utils
     upsertLayoutLocal: (row: LayoutRow) => void
     removeLayoutLocal: (id: string) => void
+
+    posters: PosterItem[]
+    posterTool: PosterKey | null
+    setPosterTool: (k: PosterKey | null) => void
+
+    addPosterOnWall: (wallId: string, t: number, key: PosterKey) => void
+    updatePosterT: (id: string, t: number) => void
+    removePoster: (id: string) => void
+    flipPoster: (id: string) => void
+
+    selectedPosterId: string | null
+    selectPoster: (id: string | null) => void
 }
 
 // ======================
@@ -133,7 +148,7 @@ function findBestBaseFor(me: PlacedItem, placed: PlacedItem[], equipments: Equip
 }
 
 // สร้าง row แบบ client-side ก่อน (created_at/updated_at จะได้ค่าจาก DB ตอน insert แต่เราทำไว้ให้ UI ลื่น)
-function makeLocalRow(args: { id: string; name: string; area: Area; walls: WallItem[]; placed: PlacedItem[] }): LayoutRow {
+function makeLocalRow(args: { id: string; name: string; area: Area; walls: WallItem[]; placed: PlacedItem[]; posters: PosterItem[] }): LayoutRow {
     const nowIso = new Date().toISOString()
     return { ...args, created_at: nowIso, updated_at: nowIso }
 }
@@ -144,6 +159,39 @@ function makeLocalRow(args: { id: string; name: string; area: Area; walls: WallI
 export const useProjectStore = create<State>()(
     persist(
         (set, get) => ({
+            posters: [],
+            posterTool: null,
+            setPosterTool: (k) => set({ posterTool: k, tool: "select" }), // บังคับกลับมา select
+
+            selectedPosterId: null,
+            selectPoster: (id) => set({ selectedPosterId: id }),
+
+            addPosterOnWall: (wallId, t, key) =>
+                set((s) => ({
+                    posters: s.posters.concat({
+                        id: crypto.randomUUID(),
+                        wallId,
+                        t: Math.max(0, Math.min(1, t)),
+                        ...POSTER_SPECS[key],
+                        offsetCm: 0,
+                        imageKey: key,
+                        flip: false,
+                    }),
+                    posterTool: null,
+                })),
+
+            updatePosterT: (id, t) =>
+                set((s) => ({
+                    posters: s.posters.map((p) => (p.id === id ? { ...p, t: Math.max(0, Math.min(1, t)) } : p)),
+                })),
+
+            removePoster: (id) => set((s) => ({ posters: s.posters.filter((p) => p.id !== id) })),
+
+            flipPoster: (id) =>
+                set((s) => ({
+                    posters: s.posters.map((p) => (p.id === id ? { ...p, flip: !p.flip } : p)),
+                })),
+
             // core
             area: { wCm: 500, dCm: 300, gridCm: 10 },
             equipments: EQUIPMENTS as unknown as Equipment[],
@@ -265,7 +313,7 @@ export const useProjectStore = create<State>()(
                 try {
                     const { data, error } = await supabase
                         .from("layouts")
-                        .select("id,name,area,walls,placed,created_at,updated_at")
+                        .select("id,name,area,walls,placed,posters,created_at,updated_at")
                         .order("updated_at", { ascending: false })
 
                     if (error) throw error
@@ -285,7 +333,14 @@ export const useProjectStore = create<State>()(
                 const s = get()
                 // ทำ row local ก่อน เพื่อให้ UI มีทันที
                 const localId = crypto.randomUUID()
-                const localRow = makeLocalRow({ id: localId, name: n, area: s.area, walls: s.walls, placed: s.placed })
+                const localRow = makeLocalRow({
+                    id: localId,
+                    name: n,
+                    area: s.area,
+                    walls: s.walls,
+                    placed: s.placed,
+                    posters: s.posters,   // ✅ เพิ่ม
+                })
                 get().upsertLayoutLocal(localRow)
 
                 try {
@@ -299,9 +354,10 @@ export const useProjectStore = create<State>()(
                                 area: s.area,
                                 walls: s.walls,
                                 placed: s.placed,
+                                posters: s.posters,
                             },
                         ])
-                        .select("id,name,area,walls,placed,created_at,updated_at")
+                        .select("id,name,area,walls,placed,posters,created_at,updated_at")
                         .single()
 
                     if (error) throw error
@@ -326,6 +382,7 @@ export const useProjectStore = create<State>()(
                         selectedId: null,
                         selectedWallId: null,
                         tool: "select",
+                        posters: x.posters ?? [],
                     }
                 }),
 
@@ -357,7 +414,7 @@ export const useProjectStore = create<State>()(
                         .from("layouts")
                         .update({ name: n })
                         .eq("id", id)
-                        .select("id,name,area,walls,placed,created_at,updated_at")
+                        .select("id,name,area,walls,placed,posters,created_at,updated_at")
                         .single()
 
                     if (error) throw error
@@ -374,6 +431,7 @@ export const useProjectStore = create<State>()(
                 area: s.area,
                 placed: s.placed,
                 walls: s.walls,
+                posters: s.posters,
                 layouts: s.layouts,
             }),
         }
