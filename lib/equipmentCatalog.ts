@@ -8,4 +8,5 @@ export const EQUIPMENTS = [
     { id: "COFFEE", name: "Coffee", wCm: 51, dCm: 61.4, hCm: 194, rotatable: true, modelUrl: "/models/coffee.glb" },
     { id: "VENDING", name: "Vending", wCm: 120, dCm: 72.4, hCm: 186, rotatable: true, modelUrl: "/models/vending.glb" },
     { id: "BACK_DROP", name: "Back drop", wCm: 300, dCm: 30, hCm: 240, rotatable: true, modelUrl: "/models/back_drop.glb" },
+    { id: "TV", name: "TV", wCm: 100, dCm: 64, hCm: 202, rotatable: true, modelUrl: "/models/tv.glb" },
 ] as const
